@@ -25,28 +25,28 @@ st.sidebar.header("3. 比例尺校正")
 scale_ratio = st.sidebar.number_input("比例尺 (像素/米)", value=50.0, help="例如：圖上 50px 代表現實 1米")
 
 # --- 核心處理函數 ---
-def process_image(pil_image, thresh_val, blur_val, scale, min_area_m2):
+def process_image(pil_image, thresh_val, blur_val, scale, min_area_m2, highlight_id=None):
     # PIL 轉 OpenCV 格式
     img_cv = np.array(pil_image.convert('RGB'))
     img_cv = img_cv[:, :, ::-1].copy() # RGB to BGR
     original = img_cv.copy()
     
+    # 獲取圖片尺寸，用於計算字體大小
+    h, w = original.shape[:2]
+    # 經驗公式：圖片越寬，字越大。例如寬 2000px 時，字體大小約 2.0
+    dynamic_font_scale = w / 1000.0 
+    dynamic_thickness = max(2, int(w / 500.0))
+
     # 1. 轉灰階
     gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
     
-    # 2. 圖像預處理 (Blur + Threshold)
-    # 使用 GaussianBlur 去除網點和雜訊
+    # 2. 圖像預處理
     blurred = cv2.GaussianBlur(gray, (blur_val, blur_val), 0)
-    
-    # 二值化：把牆變黑，背景變白 (或者反過來)
-    # 這裡假設圖是白底黑線
     _, thresh = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY_INV)
     
-    # 3. 形態學操作 (Morphology) - 自動封門
-    # 定義核 (Kernel)
-    kernel_close = np.ones((7, 7), np.uint8) # 用來封閉缺口
-    kernel_open = np.ones((3, 3), np.uint8)  # 用來去除小雜點
-    
+    # 3. 形態學操作
+    kernel_close = np.ones((7, 7), np.uint8)
+    kernel_open = np.ones((3, 3), np.uint8)
     processed = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_open, iterations=2)
     processed = cv2.morphologyEx(processed, cv2.MORPH_CLOSE, kernel_close, iterations=3)
     
@@ -56,47 +56,63 @@ def process_image(pil_image, thresh_val, blur_val, scale, min_area_m2):
     rooms_data = []
     output_img = original.copy()
     
+    # 如果有指定高亮房間，先將整張圖變暗 (Dimming)
+    if highlight_id and highlight_id != "顯示全部 (Show All)":
+        output_img = cv2.addWeighted(output_img, 0.3, np.zeros_like(output_img), 0.7, 0)
+
     room_id = 1
     
     for cnt in contours:
         area_px = cv2.contourArea(cnt)
-        
-        # 轉換為平方米
-        # Area_m2 = Area_px / (Pixels_per_meter ^ 2)
         if scale > 0:
             area_m2 = area_px / (scale ** 2)
         else:
             area_m2 = 0
             
-        # 過濾邏輯
         if area_m2 > min_area_m2:
-            # 畫圖
-            cv2.drawContours(output_img, [cnt], -1, (0, 255, 0), 3) # 綠框
+            current_id = f"R{room_id}"
             
-            # 填色 (半透明)
-            # 這裡為了簡單直接畫在圖上，如果要做半透明需要 overlay
+            # --- 決定顏色與繪圖邏輯 ---
+            is_highlighted = (highlight_id == current_id)
+            show_all = (highlight_id is None or highlight_id == "顯示全部 (Show All)")
             
-            # 標註中心點
-            M = cv2.moments(cnt)
-            if M["m00"] != 0:
-                cX = int(M["m10"] / M["m00"])
-                cY = int(M["m01"] / M["m00"])
+            # 只有在「顯示全部」或「選中該房間」時才畫
+            if show_all or is_highlighted:
                 
-                # 標籤
-                label = f"R{room_id}"
-                cv2.putText(output_img, label, (cX-20, cY), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                # 顏色：選中用紅色，普通用綠色
+                color = (0, 0, 255) if is_highlighted else (0, 255, 0)
+                thickness = dynamic_thickness * 2 if is_highlighted else dynamic_thickness
                 
+                # 畫框
+                cv2.drawContours(output_img, [cnt], -1, color, thickness)
+                
+                # 標註中心點
+                M = cv2.moments(cnt)
+                if M["m00"] != 0:
+                    cX = int(M["m10"] / M["m00"])
+                    cY = int(M["m01"] / M["m00"])
+                    
+                    # 標籤文字
+                    label = current_id
+                    if is_highlighted:
+                        label += f" ({area_m2:.1f}m2)" # 高亮時顯示面積
+                    
+                    # --- 繪製帶背景的文字 (讓字看得清) ---
+                    (text_w, text_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, dynamic_font_scale, dynamic_thickness)
+                    
+                    # 畫白色背景框
+                    cv2.rectangle(output_img, (cX, cY - text_h - 10), (cX + text_w, cY + 5), (255, 255, 255), -1)
+                    # 畫文字
+                    cv2.putText(output_img, label, (cX, cY), 
+                               cv2.FONT_HERSHEY_SIMPLEX, dynamic_font_scale, color, dynamic_thickness)
+
             rooms_data.append({
-                "Room ID": f"R{room_id}",
+                "Room ID": current_id,
                 "Area (m²)": round(area_m2, 3),
-                "Area (sq.ft)": round(area_m2 * 10.764, 1), # 測量師通常還要看呎數
-                "Type": "Room" # 暫時預設
             })
             room_id += 1
             
     return output_img, rooms_data, processed
-
 # --- 主界面邏輯 ---
 
 if uploaded_file is not None:
@@ -109,13 +125,37 @@ if uploaded_file is not None:
         st.subheader("原始圖則")
         st.image(image, use_column_width=True)
         
-    # 執行分析
-    result_img, data, debug_img = process_image(image, threshold_val, blur_kernel, scale_ratio, min_area_filter)
+     # ... (在讀取 image = Image.open(uploaded_file) 之後) ...
+
+    # --- 1. 預先執行一次分析以獲取房間列表 (為了做 Dropdown) ---
+    # 這裡我們只跑一次計算，不畫圖，純粹為了拿 Data
+    # 注意：為了效能，這不是最優解，但在 MVP 裡這樣寫最簡單
+    _, initial_data, _ = process_image(image, threshold_val, blur_kernel, scale_ratio, min_area_filter)
     
+    # 提取所有房間 ID
+    room_options = ["顯示全部 (Show All)"]
+    if initial_data:
+        room_list = [item["Room ID"] for item in initial_data]
+        room_options += room_list
+
+    # --- 2. 搜尋/高亮功能 ---
+    st.markdown("### 🔍 房間定位器 (Room Locator)")
+    selected_room = st.selectbox("選擇你想查看的房間 ID：", room_options)
+
+    # --- 3. 再次執行分析 (帶著高亮參數) ---
+    result_img, data, debug_img = process_image(image, threshold_val, blur_kernel, scale_ratio, min_area_filter, highlight_id=selected_room)
+
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("原始圖則")
+        st.image(image, use_column_width=True)
+        
     with col2:
         st.subheader("AI 識別結果")
-        # 把 OpenCV BGR 轉回 RGB 顯示
+        # 顯示結果圖
         st.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), use_column_width=True)
+      
 
     # 顯示數據表格
     st.subheader("📊 智能面積表 (Interactive GFA Schedule)")
